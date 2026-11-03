@@ -6,7 +6,7 @@
 #
 # The document is BUILT here rather than shipped: prebuilt it is about 41 MB (PartDesign stores every part's B-rep three
 # times), above the task's 20 MB limit for a stored oracle. reference/ holds the inputs: assembly.json and parts/*.step
-# (byte-identical to the grader's verify/reference/ files: the robot in its own form, one STEP file per part geometry),
+# (byte-identical to the grader's tests/reference/ files: the robot in its own form, one STEP file per part geometry),
 # core.step and foot.step (byte-identical to the payload's actuator and foot pad STEP files) and oracle_build.py, run by
 # the image's headless FreeCAD (12-20 s, most of it the save). Scores 1.0 on every gate and criterion.
 set -euo pipefail

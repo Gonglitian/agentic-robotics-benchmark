@@ -1,6 +1,6 @@
-# NOTICE - source of the ground truth of this task (verify / oracle only; never shown to the agent)
+# NOTICE - source of the ground truth of this task (tests / solution only; never shown to the agent)
 
-The photographed robot of this task (its ground truth in `reference/`, the oracle's inputs in `../oracle/`) is a
+The photographed robot of this task (its ground truth in `reference/`, the oracle's inputs in `../solution/`) is a
 **modified derivative** of the open-hardware 12-DoF quadruped **Solo12** of the Open Dynamic Robot Initiative:
 
 - printed parts, assembly and actuator design: https://github.com/open-dynamic-robot-initiative/open_robot_actuator_hardware,
@@ -60,4 +60,4 @@ Other material:
   CAD files and vertex fingerprints of the re-modelled nominal parts; it contains no geometry.
 - FreeCAD 1.1.4 (LGPL-2.0-or-later, https://github.com/FreeCAD/FreeCAD) is installed unmodified in the task image from its
   release AppImage, with the FreeCAD MCP server neka-nat/freecad-mcp @ `78bf023` (MIT, https://github.com/neka-nat/freecad-mcp)
-  vendored unmodified (`image/vendor/freecad-mcp/`).
+  vendored unmodified (`environment/vendor/freecad-mcp/`).

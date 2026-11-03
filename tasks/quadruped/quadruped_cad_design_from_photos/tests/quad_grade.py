@@ -14,9 +14,9 @@ Arguments
     sub_dir    the converter's output: assembly.json (links, parts, cores, feet, joints, foot_points and the converter's
                `conversion` block) and parts/*.step with .brep siblings (the BREP is read first: a STEP round trip can turn
                a valid solid invalid). The folder is data; nothing in it is executed.
-    ref_dir    verify/reference/: assembly.json, parts/*.step, meshes/*.stl (read instead of the STEP when present),
+    ref_dir    tests/reference/: assembly.json, parts/*.step, meshes/*.stl (read instead of the STEP when present),
                features.json
-    given_dir  verify/given/: core.json, core.step, core_keepout.step, core_collision.step, foot.json, foot.step,
+    given_dir  tests/given/: core.json, core.step, core_keepout.step, core_collision.step, foot.json, foot.step,
                public_blocklist.json
     config     grader_config.json as a dict; a missing key takes DEFAULT_CONFIG's value
     rng        numpy Generator of the per-run hidden seed (verify.py: default_rng(SeedSequence([hi, lo])))
@@ -477,7 +477,7 @@ def _mesh_from_stl(path):
 
 # ============================================================================= components (given files)
 class Components(object):
-    """The bought components of verify/given/: the actuator core (geometry, keep-out, mass, probes) and the foot pad."""
+    """The bought components of tests/given/: the actuator core (geometry, keep-out, mass, probes) and the foot pad."""
 
     def __init__(self, given_dir):
         self.dir = given_dir

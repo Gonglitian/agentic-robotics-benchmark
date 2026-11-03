@@ -1,11 +1,12 @@
 # quadruped_cad_design_from_photos's environment image (hardware-design stage of a 12-DoF quadruped, FreeCAD MCP).
 #
-# `image/` is the sole build context and the final stage derives DIRECTLY from the official ALE base. The block down to
-# the venv self-check is the chain's shared base `shared/images/arb-base-mujoco/Dockerfile` reproduced verbatim (same
-# layers, same requirements.txt bytes): the grader needs it. Task layers: FreeCAD 1.1.4, the openbox desktop that runs
-# FreeCAD only, the FreeCAD MCP server, the Q15 idle-timeout ENV. No task material, no hidden data: the givens are
-# staged by setup/run.sh, the grader lives in verify/ (absent from the image).
-FROM ghcr.io/agentslastexam/container-ubuntu22-base:latest
+# `environment/` without its `setup/` folder is the sole build context and the final stage derives DIRECTLY from the
+# official ALE base. The block down to the venv self-check is the chain's shared base
+# `shared/images/arb-base-mujoco/Dockerfile` reproduced verbatim (same layers, same requirements.txt bytes): the grader
+# needs it. Task layers: FreeCAD 1.1.4, the openbox desktop that runs FreeCAD only, the FreeCAD MCP server, the Q15
+# idle-timeout ENV. No task material, no hidden data: the givens are staged by environment/setup/setup.sh, the grader
+# lives in tests/ (absent from the image).
+FROM ghcr.io/agentslastexam/container-ubuntu22-base:0.1.1
 
 COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
 
@@ -51,7 +52,7 @@ RUN curl -fsSL -o /tmp/FreeCAD.AppImage "$FREECAD_URL" \
 
 # The FreeCAD MCP server (neka-nat/freecad-mcp, MIT, vendored at a pinned commit: vendor/freecad-mcp/VENDORED.md): its
 # addon serves the RPC calls inside the GUI session (started with FreeCAD, local connections only), its MCP server
-# (/opt/freecad-mcp) is the task's declared stdio MCP server (tools/mcp/freecad.toml).
+# (/opt/freecad-mcp) is the task's declared stdio MCP server (task.toml, [[environment.mcp_servers]] `freecad`).
 COPY vendor/freecad-mcp /opt/freecad-mcp-src
 RUN cp -r /opt/freecad-mcp-src/addon/FreeCADMCP /opt/freecad/usr/Mod/FreeCADMCP \
     && cd /opt/freecad-mcp-src && VIRTUAL_ENV= UV_PROJECT_ENVIRONMENT=/opt/freecad-mcp uv sync --frozen --no-dev --no-cache --python 3.12 \
@@ -102,9 +103,9 @@ RUN printf '%s\n' 'export BUN_CONFIG_HTTP_IDLE_TIMEOUT=1800' 'export CLAUDE_STRE
 # ---- task assets ---------------------------------------------------------------------------------------------------
 # The photo set and the bought components' documents and STEP files live in the benchmark's Hugging Face asset
 # repository (tasks/quadruped/quadruped_cad_design_from_photos/payload/ there). They are fetched at the commit pinned in
-# assets.sha256 and checked file by file; setup/run.sh stages them into the agent home. fetch_assets.py is the benchmark's canonical copy
-# (shared/task_assets/) and the repository named in assets.sha256 is written from task-assets.toml
-# (scripts/task_assets.py sync; docs/task-assets.md).
+# assets.sha256 and checked file by file; environment/setup/setup.sh stages them into the agent home. fetch_assets.py is
+# the benchmark's canonical copy (shared/task_assets/) and the repository named in assets.sha256 is written from
+# task-assets.toml (scripts/task_assets.py sync; docs/task-assets.md).
 COPY fetch_assets.py assets.sha256 /opt/task-assets/
 RUN python3 /opt/task-assets/fetch_assets.py /opt/task-assets/assets.sha256 /opt/task-assets/payload \
     && chmod -R a+rX /opt/task-assets

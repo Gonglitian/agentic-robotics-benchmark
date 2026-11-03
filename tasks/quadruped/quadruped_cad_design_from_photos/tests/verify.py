@@ -25,8 +25,9 @@ verify stage, agent gone. A task-local fork of the arm task's verify.py (the sam
      with the shape floor and the per-leg foot-point floors (weights, bands and floors in grader_config.json).
      design_score = the weighted mean; the verdict's single gated `reward` comes from the benchmark kit
      (robotics_grader.ratio_rewards against anchor.json: value 1.0 = the oracle, full_at 1.0), so reward = design_score.
-No agent code runs here (the document is data that FreeCAD reads). Knobs: grader_config.json. Hooks for host runs (as the
-arm's): ALE_STAGE_DIR, ALE_HOME, ARB_SNAPSHOT_ROOT, ARB_FREECADCMD, ARB_SEEDS_PIN="hi:lo", ALE_VERDICT_PATH.
+No agent code runs here (the document is data that FreeCAD reads). Knobs: grader_config.json. Hooks for host runs, as
+the arm's: ALE_STAGE_DIR, ALE_HOME, ARB_SNAPSHOT_ROOT, ARB_FREECADCMD, ARB_SEEDS_PIN="hi:lo"; and the verdict file of a
+run outside the engine, ROBOTICS_GRADER_VERDICT_PATH (default verdict.local.json in the stage folder).
 """
 import json
 import math
@@ -54,7 +55,7 @@ EXTRACT_USER = "nobody"
 DOCUMENT = "quadruped.FCStd"
 MCP_TOOL_PREFIX = "mcp__freecad__"
 DIAGNOSTIC_ITEM_CHARS = 150
-MAX_DIAGNOSTIC_CHARS = 2000          # ale_verify's cap on a check's diagnostic (a longer text raises there)
+MAX_DIAGNOSTIC_CHARS = 2000          # the earlier ale_verify API's diagnostic cap, kept: the recorded text is unchanged
 RESERVED_METRICS = ("reward", "ratio", "anchor_recorded")
 
 from arm.assembly_six import lockdown  # noqa: E402  (stdlib only; vendored)
@@ -346,7 +347,8 @@ def design_score(rewards, weights, criteria):
 
 
 def diagnostic_text(rewards, details, checks, criteria, stats):
-    """One line per check, the leg verdicts and one per criterion, each item capped, the whole within ale_verify's cap."""
+    """One line per check, the leg verdicts and one per criterion, each item capped, the whole within
+    MAX_DIAGNOSTIC_CHARS."""
     parts = []
     for k in checks:
         parts.append("%s %.4f: %s" % (k, float(rewards[k]), " | ".join(str(d) for d in details.get(k, []))[:DIAGNOSTIC_ITEM_CHARS]))
@@ -357,11 +359,29 @@ def diagnostic_text(rewards, details, checks, criteria, stats):
     return "; ".join(parts)[:MAX_DIAGNOSTIC_CHARS]
 
 
+def _finite_metrics(metrics):
+    """`metrics` in name order, finite numbers only: ale_verify.write refuses NaN and infinity, so a statistic that is
+    not a finite number stays out of the engine's record instead of failing the verdict."""
+    out = {}
+    for k, v in sorted(metrics.items()):
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(x):
+            out[k] = x
+    return out
+
+
 def write_verdict(checks, criteria, rewards, weights, stats, details):
     """One gated `reward` in the benchmark kit's envelope (robotics_grader.ratio_rewards against anchor.json: value 1.0 =
     the oracle, full_at 1.0, so reward = design_score); the checks, the criteria and every statistic go to `metrics`, the
-    per-check and per-criterion diagnostics into the reward check's text (the run record keeps them)."""
+    per-check and per-criterion diagnostics into the verdict's `diagnostic` text (the run record keeps them). In the
+    engine (ALE_VERIFY_PYTHON set) the kit writes /logs/verifier/reward.json and verification.json through ale_verify;
+    a host-side run writes the plain envelope to ROBOTICS_GRADER_VERDICT_PATH, else to verdict.local.json in the stage
+    folder."""
     from robotics_grader import ratio_rewards, read_anchor
+    from robotics_grader import write_verdict as kit_write
     overall = design_score(rewards, weights, criteria)
     anchor, meta = read_anchor()
     metric = meta.get("metric", "design_score")
@@ -370,20 +390,12 @@ def write_verdict(checks, criteria, rewards, weights, stats, details):
     verdict = ratio_rewards(overall, anchor, higher_is_better=meta.get("direction", "higher") == "higher",
                             metric_name=metric, extra=extra, full_at=meta.get("full_at", 1.0))
     text = diagnostic_text(rewards, details, checks, criteria, stats)
-    if os.environ.get("ALE_VERIFICATION_PATH"):
-        from ale_verify import CheckResult, Verification
-        rec = Verification()
-        rec.check("reward", CheckResult(float(verdict["rewards"]["reward"]), text[:MAX_DIAGNOSTIC_CHARS]))
-        for k, v in sorted(verdict["metrics"].items()):
-            try:
-                rec.stat(k, float(v))
-            except (TypeError, ValueError):
-                pass
-        rec.write()
+    if os.environ.get("ALE_VERIFY_PYTHON"):
+        recorded = {"rewards": verdict["rewards"], "metrics": _finite_metrics(verdict["metrics"])}
+        kit_write(recorded, diagnostic=text[:MAX_DIAGNOSTIC_CHARS])
         return overall, verdict
-    out = dict(verdict, diagnostics=details, diagnostic_text=text)
-    with open(os.environ.get("ALE_VERDICT_PATH", os.path.join(STAGE_DIR, "verdict.local.json")), "w") as fh:
-        json.dump(out, fh, indent=1, default=str)
+    local = os.environ.get("ROBOTICS_GRADER_VERDICT_PATH") or os.path.join(STAGE_DIR, "verdict.local.json")
+    kit_write(verdict, path=local, diagnostic=text)
     return overall, verdict
 
 
