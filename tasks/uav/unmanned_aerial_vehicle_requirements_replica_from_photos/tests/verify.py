@@ -78,8 +78,7 @@ def snapshot():
 
 def main():
     sub,metrics=snapshot()
-    from ale_verify import Verification,CheckResult
-    from robotics_grader import read_anchor,ratio_rewards
+    from robotics_grader import read_anchor,ratio_rewards,write_verdict
     import grade
     truth=json.loads((STAGE/'gt.json').read_text())
     schemas=json.loads((STAGE/'schemas.json').read_text())
@@ -101,9 +100,10 @@ def main():
     metrics['given_files_unchanged']=same/len(expected)
     denominator,meta=read_anchor()
     verdict=ratio_rewards(value,denominator,metric_name='requirements_score',extra=metrics,full_at=meta['full_at'])
-    rec=Verification();rec.check('reward',CheckResult(verdict['rewards']['reward'],diagnostic[:2000]))
-    for k,v in verdict['metrics'].items():rec.stat(k,float(v))
-    rec.write()
+    # reward.json and verification.json through the kit and the engine's ale_verify. diagnostic[:2000] is the earlier
+    # ale_verify API's diagnostic cap, kept so the recorded text is unchanged; every metric is recorded as float(v) and
+    # a non-finite one still fails the verdict, as rec.stat did.
+    write_verdict(verdict,diagnostic=diagnostic[:2000])
 
 
 if __name__=='__main__':main()
