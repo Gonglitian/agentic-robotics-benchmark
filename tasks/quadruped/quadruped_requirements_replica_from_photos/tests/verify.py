@@ -227,7 +227,8 @@ def write_verdict(rewards, weights, stats, diagnostics, per, total):
     """One gated `reward` (the kit's envelope); the criteria and stats go to `metrics`, the per-criterion diagnostics
     into the verdict's `diagnostic` text. In the engine (ALE_VERIFY_PYTHON set) the kit writes
     /logs/verifier/reward.json and verification.json through ale_verify, every metric through _fin as on the earlier
-    engine API; a host-side run writes the plain envelope to verdict.local.json in the stage folder (and the text to
+    engine API; a host-side run writes the plain envelope to ROBOTICS_GRADER_VERDICT_PATH, else verdict.local.json in
+    the stage folder (and the text to
     ARB_DIAGNOSTICS_PATH when that is set)."""
     from robotics_grader import ratio_rewards, read_anchor
     from robotics_grader import write_verdict as kit_write
@@ -248,7 +249,8 @@ def write_verdict(rewards, weights, stats, diagnostics, per, total):
                     "metrics": {k: _fin(v) for k, v in sorted(verdict["metrics"].items())}}
         kit_write(recorded, diagnostic=text)    # text: cut to total_chars (2000) above, as the earlier API required
         return overall
-    kit_write(verdict, path=os.path.join(STAGE_DIR, "verdict.local.json"), diagnostic=text)
+    kit_write(verdict, path=os.environ.get("ROBOTICS_GRADER_VERDICT_PATH") or os.path.join(STAGE_DIR, "verdict.local.json"),
+              diagnostic=text)
     if os.environ.get("ARB_DIAGNOSTICS_PATH"):                 # outside the engine: the verdict's diagnostic text
         with open(os.environ["ARB_DIAGNOSTICS_PATH"], "w", encoding="utf-8") as fh:
             fh.write(text)
