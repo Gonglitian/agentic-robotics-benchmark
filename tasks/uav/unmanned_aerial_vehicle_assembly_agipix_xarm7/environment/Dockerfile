@@ -1,4 +1,4 @@
-FROM ghcr.io/agentslastexam/container-ubuntu22-base:latest
+FROM ghcr.io/agentslastexam/container-ubuntu22-base:0.1.1
 COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y --no-install-recommends libosmesa6 libgl1 libgomp1 libxrender1 libxext6 libxi6 libxcursor1 libxinerama1 libxrandr2 mesa-vulkan-drivers libvulkan1 && rm -rf /var/lib/apt/lists/*
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
