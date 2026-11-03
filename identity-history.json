@@ -30,6 +30,12 @@
     "spec_hash": "sha256:6e5220c8e1f23619af7b813d0c474767decdddfcf79f2133b4d1c442f9b581a8"
   },
   {
+    "content_digest": "sha256:0aa5844bf805fe6795a76fcde31247f7f8eed29e7867f1190f4d63140ac29dbe",
+    "since": "2026-11-03T21:52:39Z",
+    "slug": "fault_adaptive_spacecraft_docking",
+    "spec_hash": "sha256:4f9d77a1860807d3eec6728a5832f0fc775e3ae46e860e05258c25dad79f38b6"
+  },
+  {
     "content_digest": "sha256:815315deea2dcf0f41dbe7cca713f2b096447aaacd76a5064e1ae92df831ae6f",
     "since": "2026-11-03T21:39:57Z",
     "slug": "fault_adaptive_spacecraft_docking",
