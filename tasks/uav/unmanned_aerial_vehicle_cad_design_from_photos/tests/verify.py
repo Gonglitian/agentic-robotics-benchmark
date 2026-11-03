@@ -16,7 +16,7 @@ def main():
             raise RuntimeError("Agent processes survived verify-start isolation")
         # Heavy geometry imports happen only after locking the hidden stage and freezing agent processes.
         from grade import grade
-        from robotics_grader import read_anchor, ratio_rewards
+        from robotics_grader import read_anchor, ratio_rewards, write_verdict
         stage = Path(runtime.STAGE_DIR)
         config = json.loads((stage / "grader_config.json").read_text())
         stats = {k:v for k,v in early.items() if isinstance(v,float)}
@@ -53,17 +53,15 @@ def main():
         anchor, meta = read_anchor()
         verdict = ratio_rewards(report["design_score"], anchor, metric_name=meta["metric"],
                                 higher_is_better=True, full_at=meta["full_at"], extra=stats)
-        if os.environ.get("ALE_VERIFICATION_PATH"):
-            from ale_verify import Verification, CheckResult
-            rec = Verification()
-            diagnostic = json.dumps({"criteria":report["criteria"],"diagnostics":report["diagnostics"]})
-            rec.check("reward", CheckResult(verdict["rewards"]["reward"], diagnostic[:2000]))
-            for k,v in verdict["metrics"].items():
-                rec.stat(k,float(v))
-            rec.write()
+        # In the engine (ALE_VERIFY_PYTHON set) the kit writes /logs/verifier/reward.json and verification.json through
+        # ale_verify: the reward, every metric as a float (a non-finite one fails the run, as the earlier API's stat did)
+        # and the criteria / diagnostics text. A host-side run writes the plain envelope to verdict.local.json here.
+        diagnostic = json.dumps({"criteria":report["criteria"],"diagnostics":report["diagnostics"]})
+        if os.environ.get("ALE_VERIFY_PYTHON"):
+            # diagnostic[:2000]: the diagnostic cap of the earlier ale_verify API, kept so the recorded text is unchanged
+            write_verdict(verdict, diagnostic=diagnostic[:2000])
         else:
-            path = os.environ.get("ALE_VERDICT_PATH", str(stage / "verdict.local.json"))
-            Path(path).write_text(json.dumps(dict(verdict,details=report),indent=2)+"\n")
+            write_verdict(verdict, path=str(stage / "verdict.local.json"), diagnostic=diagnostic)
     finally:
         runtime._restore(early)
         freezer.stop()
