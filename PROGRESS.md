@@ -364,6 +364,8 @@ Gotchas found on the way:
   match lock passed, raw 0.2217035448. A second scored replay produced 12 docks, 7 collisions,
   raw 0.2625658218, ratio 0.5732670506 and reward 0.7643560675. This no longer saturates the
   benchmark; its success rate is 21--25%, versus the previous Opus 5.5 46--48/48 result.
+- Not yet validated on the Harbor-based engine (§8): PR #10's branch pins `vendor/ale` at
+  `90a7c1c`, and §8's `validate-44ad164a` on `1cdbc02` ran the version before this hardening.
 
 ## Open items
 
