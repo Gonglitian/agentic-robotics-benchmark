@@ -61,7 +61,8 @@ def main():
             # diagnostic[:2000]: the diagnostic cap of the earlier ale_verify API, kept so the recorded text is unchanged
             write_verdict(verdict, diagnostic=diagnostic[:2000])
         else:
-            write_verdict(verdict, path=str(stage / "verdict.local.json"), diagnostic=diagnostic)
+            write_verdict(verdict, path=os.environ.get("ROBOTICS_GRADER_VERDICT_PATH") or str(stage / "verdict.local.json"),
+                          diagnostic=diagnostic)
     finally:
         runtime._restore(early)
         freezer.stop()
