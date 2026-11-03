@@ -1,7 +1,7 @@
 """Grader of quadruped_requirements_replica_from_photos (information tier, requirements stage). Root, verify stage, the
 agent gone. No agent code runs here: the submission is three static files (YAML / JSON).
 
-  0. FIRST THING, stdlib only (`_early_lockdown`; run.sh has already chmod 0700 the stage and its parent): record when
+  0. FIRST THING, stdlib only (`_early_lockdown`; test.sh has already chmod 0700 the stage and its parent): record when
      the engine began uploading this folder (the earliest ctime of its files), freeze and kill every process of the
      agent account (a survivor voids the run: task error), lock the stage (0700 / 0600, restored at the end), gate G1
      (submission integrity): an entry of the submission written at or after the upload began, or a submission ROOT
@@ -225,8 +225,12 @@ def _cut(text, n):
 
 def write_verdict(rewards, weights, stats, diagnostics, per, total):
     """One gated `reward` (the kit's envelope); the criteria and stats go to `metrics`, the per-criterion diagnostics
-    into the reward check's text."""
+    into the verdict's `diagnostic` text. In the engine (ALE_VERIFY_PYTHON set) the kit writes
+    /logs/verifier/reward.json and verification.json through ale_verify, every metric through _fin as on the earlier
+    engine API; a host-side run writes the plain envelope to verdict.local.json in the stage folder (and the text to
+    ARB_DIAGNOSTICS_PATH when that is set)."""
     from robotics_grader import ratio_rewards, read_anchor
+    from robotics_grader import write_verdict as kit_write
     overall = sum(float(rewards[c]) * float(weights[c]) for c in CRITERIA) / sum(float(weights[c]) for c in CRITERIA)
     anchor, meta = read_anchor()
     extra = {k: _fin(v) for k, v in stats.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
@@ -239,17 +243,13 @@ def write_verdict(rewards, weights, stats, diagnostics, per, total):
     # R2-D1: agent strings reach the text (a G0 message quotes a sketch value with %s, the G1 reason lists late file
     # names decoded with surrogateescape); a lone surrogate would make every UTF-8 writer raise, so escape it
     text = _cut(text.encode("utf-8", "backslashreplace").decode("utf-8"), total)
-    if os.environ.get("ALE_VERIFICATION_PATH"):
-        from ale_verify import CheckResult, Verification
-        rec = Verification()
-        rec.check("reward", CheckResult(float(verdict["rewards"]["reward"]), text))
-        for k, v in sorted(verdict["metrics"].items()):
-            rec.stat(k, _fin(v))
-        rec.write()
+    if os.environ.get("ALE_VERIFY_PYTHON"):
+        recorded = {"rewards": verdict["rewards"],
+                    "metrics": {k: _fin(v) for k, v in sorted(verdict["metrics"].items())}}
+        kit_write(recorded, diagnostic=text)    # text: cut to total_chars (2000) above, as the earlier API required
         return overall
-    from robotics_grader import write_verdict as kit_write
-    kit_write(verdict, os.environ.get("ALE_VERDICT_PATH", os.path.join(STAGE_DIR, "verdict.local.json")))
-    if os.environ.get("ARB_DIAGNOSTICS_PATH"):                 # outside the engine: the reward check's text
+    kit_write(verdict, path=os.path.join(STAGE_DIR, "verdict.local.json"), diagnostic=text)
+    if os.environ.get("ARB_DIAGNOSTICS_PATH"):                 # outside the engine: the verdict's diagnostic text
         with open(os.environ["ARB_DIAGNOSTICS_PATH"], "w", encoding="utf-8") as fh:
             fh.write(text)
     return overall

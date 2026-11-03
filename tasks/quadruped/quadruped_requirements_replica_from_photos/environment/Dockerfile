@@ -1,12 +1,12 @@
 # robotic_arm_requirements_replica_from_photos's environment image (information tier, requirements stage).
 #
-# `image/` is the sole build context and the final stage derives DIRECTLY from the official ALE base (`ale lint`
-# rejects any other final FROM). The block below is the chain's shared base `shared/images/arb-base-mujoco/Dockerfile`
+# `environment/` without its `setup/` folder is the sole build context and the final stage derives DIRECTLY from the
+# official ALE base. The block below is the chain's shared base `shared/images/arb-base-mujoco/Dockerfile`
 # reproduced verbatim (same RUN / COPY / ENV lines, same requirements.txt bytes), so its layers come from the Docker
 # layer cache of that base. Task layers (PLAN.md T17): opencv-python-headless + scikit-image (a human engineer's
 # photogrammetry tools), then the Q15 idle-timeout ENV block. No task material, no hidden data: the givens are staged
-# by setup/run.sh, the grader lives in verify/ (absent from the image).
-FROM ghcr.io/agentslastexam/container-ubuntu22-base:latest
+# by environment/setup/setup.sh, the grader lives in tests/ (absent from the image).
+FROM ghcr.io/agentslastexam/container-ubuntu22-base:0.1.1
 
 COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
 

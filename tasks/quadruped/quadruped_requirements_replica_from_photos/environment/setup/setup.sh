@@ -3,7 +3,7 @@
 # photos, datasheet and erratum pages, the three lot reports, schemas, the structure check and the public, data-free
 # grading modules) into the agent home, owned by the agent. Nothing hidden is in this folder: the reference unit's
 # ground truth and the vendors' own numbers live in the grader's stage (absent during the agent phase). Dynamic-only:
-# packages are in image/Dockerfile.
+# packages are in environment/Dockerfile.
 set -euo pipefail
 HOME_DIR="${ALE_HOME:-/home/user}"
 AGENT_USER="$(basename "$HOME_DIR")"
