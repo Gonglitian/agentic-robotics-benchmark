@@ -7,10 +7,15 @@ whose predict(rgb, depth, intrinsics, depth_scale) returns grasps. This stage:
   2. stops every process the agent's account left running;
   3. fetches the hidden frames (28 GraspNet-1Billion novel-object scenes x 16 views, meshes and
      poses for their 26 objects; pinned and hash-checked) into this root-only stage folder;
-  4. copies only each frame's inputs (colour, depth, intrinsics) to a world-readable folder and
-     runs the detector over them in 8 processes as the agent's account, offline (seccomp, see
-     predict_child.py), with a per-frame deadline enforced from here;
-  5. stops the agent's account again and scores the returned arrays as root with graspnetAPI's
+  4. runs the detector in 8 processes as the agent's account, offline (seccomp, see
+     predict_child.py), each on a block of 56 frames of one fixed shuffle (grader_config
+     frame_order_seed), handing a process one frame's inputs (colour, depth, intrinsics) at a
+     time over a pipe, and only after it has answered the previous frame. Every call is timed on
+     this process's clock from the hand-over; an array that is not back within the limit is never
+     accepted, and the process is killed and restarted (a fresh import) for the next frame, within
+     the block's time budget. The arrays received in time go to a root-only folder; no frame is
+     ever on disk where the agent's account could read it;
+  5. stops the agent's account again and scores the accepted arrays as root with graspnetAPI's
      own force-closure evaluation (score_frames.py), which never imports submitted code;
   6. reports the AP the submission adds over the provided starting detector, RE-Bench style:
      ap_gain = max(0, mean AP over all 448 frames - the starting detector's own mean AP on them)
@@ -24,12 +29,16 @@ import hashlib
 import json
 import os
 import pwd
+import random
+import select
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from robotics_grader import (agent_user, deprivileged, fail, ratio_rewards, read_anchor,
@@ -38,10 +47,8 @@ from robotics_grader import (agent_user, deprivileged, fail, ratio_rewards, read
 GRASP_PY = "/opt/grasp/bin/python"
 HOME = os.environ.get("ALE_HOME", "/home/user")
 SUBMISSION = os.path.join(HOME, "submission")
-# Set by make_workdir(): a fresh mkdtemp folder (an agent cannot pre-plant it), root-owned and
-# world-traversable, holding FRAMES (inputs only: rgb.png, depth.png, camK.npy) and PRED (owned
-# by the agent's account, where the solver processes write).
-WORK = FRAMES = PRED = None
+# Set by make_workdir().
+WORK = RESULTS = None
 CHILD_ENV = {
     # subprocess resolves `runuser` (in /usr/sbin) through this PATH, not the grader's own
     "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -184,21 +191,20 @@ def export_ground_truth(sealed, frames):
 
 
 def make_workdir():
-    global WORK, FRAMES, PRED
+    """WORK: a fresh root-owned, world-traversable folder holding the root-owned copy of predict_child.py
+    (and, for the privileged reference only, the ground truth). RESULTS: root-only, where the arrays the
+    grader received in time are written; the agent's account can neither read nor write it. No frame is
+    ever written anywhere the agent's account can read: each one reaches its solver process over a pipe,
+    when that process asks for the next frame."""
+    global WORK, RESULTS
     WORK = tempfile.mkdtemp(prefix="grasp_grading_", dir="/tmp")
-    FRAMES = os.path.join(WORK, "frames")
-    PRED = os.path.join(WORK, "pred")
+    RESULTS = os.path.join(stage_dir(), "results")
+    shutil.rmtree(RESULTS, ignore_errors=True)
+    os.makedirs(RESULTS, mode=0o700)
+    os.chmod(RESULTS, 0o700)
 
 
-def export_inputs(sealed, frames, uid, gid, with_ground_truth=False):
-    os.makedirs(FRAMES)
-    for sid, view in frames:
-        src = os.path.join(sealed, "scenes", "scene_%04d" % sid, "realsense")
-        dst = os.path.join(FRAMES, "%04d_%04d" % (sid, view))
-        os.makedirs(dst)
-        shutil.copyfile(os.path.join(src, "rgb", "%04d.png" % view), os.path.join(dst, "rgb.png"))
-        shutil.copyfile(os.path.join(src, "depth", "%04d.png" % view), os.path.join(dst, "depth.png"))
-        shutil.copyfile(os.path.join(src, "camK.npy"), os.path.join(dst, "camK.npy"))
+def export_child(sealed, frames, with_ground_truth=False):
     shutil.copyfile(os.path.join(stage_dir(), "predict_child.py"),
                     os.path.join(WORK, "predict_child.py"))
     if with_ground_truth:
@@ -207,142 +213,254 @@ def export_inputs(sealed, frames, uid, gid, with_ground_truth=False):
         os.chmod(root, 0o755)
         for name in files:
             os.chmod(os.path.join(root, name), 0o644)
-    os.makedirs(PRED)
-    os.chown(PRED, uid, gid)
-    os.chmod(PRED, 0o755)
 
 
 # --------------------------------------------------------------------------- solver runs
-def _read_small(path, limit=2000):
-    """Read a status file the agent's account wrote, refusing anything but a regular file."""
-    try:
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode):
-            return "not a regular file"
-        with open(path, errors="replace") as handle:
-            return handle.read(limit)
-    except OSError as exc:
-        return "unreadable: %s" % exc
+# Wire format between this process and predict_child.py: a 1-byte tag, a 4-byte big-endian length, the payload.
+MAX_TEXT = 4096
+MAX_RESULT = 1024 + 5000 * 17 * 8               # the largest valid array as .npy (score_frames.MAX_BYTES)
 
 
-class Slot(object):
-    """One solver process working through its share of the frames, restarted after a kill."""
+def frame_message(sealed, name, privileged_run):
+    sid, view = (int(v) for v in name.split("_"))
+    src = os.path.join(sealed, "scenes", "scene_%04d" % sid, "realsense")
+    blobs = []
+    for path in (os.path.join(src, "rgb", "%04d.png" % view), os.path.join(src, "depth", "%04d.png" % view),
+                 os.path.join(src, "camK.npy")):
+        with open(path, "rb") as handle:
+            blobs.append(handle.read())
+    header = json.dumps({"name": name if privileged_run else "", "sizes": [len(b) for b in blobs]})
+    payload = header.encode() + b"\n" + b"".join(blobs)
+    return b"F" + struct.pack(">I", len(payload)) + payload
 
-    def __init__(self, index, names, cfg, logs):
+
+class Slot(threading.Thread):
+    """One solver process working through a contiguous block of frames, restarted after a kill.
+
+    Every frame is handed over only when the process has answered the previous one, and timed here, on the
+    grader's monotonic clock, from the moment the hand-over starts: an array that is not back within the
+    frame limit is never accepted, the process is killed and a fresh one (a fresh import) takes the next
+    frame. Only arrays received in time are written to RESULTS, so only they are scored."""
+
+    def __init__(self, index, names, cfg, logs, sealed, uid, privileged_run):
+        threading.Thread.__init__(self, name="slot%d" % index, daemon=True)
         self.index, self.remaining, self.cfg, self.logs = index, list(names), cfg, logs
-        self.attempt, self.proc, self.done = 0, None, not names
-        self.seen_start = {}
-        self.guard_failed = False
+        self.sealed, self.uid, self.privileged_run = sealed, uid, privileged_run
+        self.frame_limit = cfg["oracle_frame_timeout_s"] if privileged_run else cfg["frame_timeout_s"]
+        # The block's own time budget: every frame at the limit plus the first import and `spare_imports`
+        # re-imports at theirs. A process that is restarted after a timeout or a death pays its import out of
+        # it; once it is spent, the block's remaining frames score 0. It keeps the stage inside its deadline.
+        self.budget = len(self.remaining) * self.frame_limit + \
+            (1 + int(cfg["spare_imports"])) * cfg["import_timeout_s"]
+        self.budget_end = None
+        self.attempt, self.proc, self.buf = 0, None, bytearray()
+        self.status, self.elapsed = {}, {}
+        self.guard_failed, self.error = False, None
 
-    def tag(self):
-        return "%d_%d" % (self.index, self.attempt)
-
-    def start(self):
+    # ---- the child process
+    def _start(self):
         self.attempt += 1
-        listing = os.path.join(WORK, "list_%s.txt" % self.tag())
-        with open(listing, "w") as handle:
-            handle.write("\n".join(self.remaining) + "\n")
-        os.chmod(listing, 0o644)
-        out = open(os.path.join(self.logs, "solver_%s.log" % self.tag()), "w")
+        tag = "%d_%d" % (self.index, self.attempt)
+        log_file = open(os.path.join(self.logs, "solver_%s.log" % tag), "wb")
         self.proc = deprivileged(
-            [GRASP_PY, "-I", os.path.join(WORK, "predict_child.py"), FRAMES, PRED, listing,
-             self.tag(), str(self.cfg["frame_timeout_s"])],
-            cwd=SUBMISSION, env=CHILD_ENV, stdout=out, stderr=subprocess.STDOUT,
-            start_new_session=True)
-        self.started_at = time.time()
+            [GRASP_PY, "-I", os.path.join(WORK, "predict_child.py"), tag],
+            cwd=SUBMISSION, env=CHILD_ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=log_file, start_new_session=True)
+        log_file.close()
+        self.wfd, self.rfd = self.proc.stdin.fileno(), self.proc.stdout.fileno()
+        os.set_blocking(self.wfd, False)
+        os.set_blocking(self.rfd, False)
+        self.buf = bytearray()
+        self.started_at = time.monotonic()
 
-    def kill(self):
-        if self.proc is not None and self.proc.poll() is None:
+    def _kill(self):
+        """SIGKILL the process group and every process of the agent's account still in this attempt's session."""
+        proc = self.proc
+        if proc is None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        for pid in _live_uid_pids(self.uid):
             try:
-                os.killpg(self.proc.pid, signal.SIGKILL)
+                if os.getsid(pid) == proc.pid:
+                    os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
-            self.proc.wait()
+        proc.wait()
+        for handle in (proc.stdin, proc.stdout):
+            try:
+                handle.close()
+            except OSError:
+                pass
+        self.proc = None
 
-    def poll(self, status, now):
-        """Advance this slot; returns False once it has nothing left to do."""
-        if self.done:
-            return False
-        # frames finished since the last poll
-        while self.remaining:
-            name = self.remaining[0]
-            if os.path.lexists(os.path.join(PRED, name + ".npy")):
-                status[name] = "returned"
-            elif os.path.lexists(os.path.join(PRED, name + ".err")):
-                status[name] = _read_small(os.path.join(PRED, name + ".err"), 300)
-            else:
-                break
-            self.remaining.pop(0)
-        if not self.remaining:
-            self.kill()
-            self.done = True
-            return False
-        grace = self.cfg["kill_grace_s"]
-        ready = os.path.lexists(os.path.join(PRED, "_ready_" + self.tag()))
-        alive = self.proc.poll() is None
-        if not ready:
-            err = os.path.join(PRED, "_import_error_" + self.tag())
-            guarded = os.path.lexists(os.path.join(PRED, "_guard_ok_" + self.tag()))
-            if not alive and not guarded:
-                # The child exits before importing anything when the seccomp filter cannot be
-                # installed, so the submission never ran: this is the grader's failure.
-                self.guard_failed = True
-                self._give_up(status, "network guard could not be installed")
-            elif os.path.lexists(err) or not alive:
-                why = _read_small(err) if os.path.lexists(err) else \
-                    "solver process exited with %s before importing" % self.proc.poll()
-                self._give_up(status, "import failed: " + why[:200])
-            elif now - self.started_at > self.cfg["import_timeout_s"] + grace:
-                self.kill()
-                self._give_up(status, "import did not finish in %ds" % self.cfg["import_timeout_s"])
-            return not self.done
-        name = self.remaining[0]
-        if os.path.lexists(os.path.join(PRED, name + ".started")):
-            self.seen_start.setdefault(name, now)
-        overdue = name in self.seen_start and \
-            now - self.seen_start[name] > self.cfg["frame_timeout_s"] + grace
-        if overdue or not alive:
-            self.kill()
-            status[name] = "timeout (process killed)" if overdue else \
-                "solver process died (exit %s)" % self.proc.returncode
-            self.remaining.pop(0)
-            if self.remaining:
-                self.start()
-            else:
-                self.done = True
-        return not self.done
+    def _send(self, data, deadline):
+        """Write `data` before `deadline`; False if the process stopped reading or the time ran out."""
+        view = memoryview(data)
+        while view:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            _, ready, _ = select.select([], [self.wfd], [], min(left, 1.0))
+            if not ready:
+                continue
+            try:
+                view = view[os.write(self.wfd, view):]
+            except BlockingIOError:
+                continue
+            except OSError:                                # BrokenPipeError: the process is gone
+                return False
+        return True
 
-    def _give_up(self, status, why):
+    def _recv(self, deadline, cap):
+        """The next message as (tag, payload); ('timeout'|'eof'|'oversize', None) otherwise."""
+        while True:
+            if len(self.buf) >= 5:
+                size = struct.unpack(">I", bytes(self.buf[1:5]))[0]
+                if size > cap:
+                    return "oversize", None
+                if len(self.buf) >= 5 + size:
+                    tag, payload = bytes(self.buf[:1]), bytes(self.buf[5:5 + size])
+                    del self.buf[:5 + size]
+                    return tag, payload
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return "timeout", None
+            ready, _, _ = select.select([self.rfd], [], [], min(left, 1.0))
+            if not ready:
+                continue
+            try:
+                chunk = os.read(self.rfd, 1 << 20)
+            except BlockingIOError:
+                continue
+            except OSError:
+                return "eof", None
+            if not chunk:
+                return "eof", None
+            self.buf += chunk
+
+    # ---- the frames
+    def _give_up(self, why):
         for name in self.remaining:
-            status[name] = why
+            self.status[name] = why
         self.remaining = []
-        self.done = True
+
+    def _import(self):
+        """Start a process and wait for its import; True when it is ready for frames."""
+        if time.monotonic() >= self.budget_end:
+            self._give_up("timeout: the block's time budget (%ds) was spent" % self.budget)
+            return False
+        self._start()
+        # G comes before the submission runs, so its wait is never cut short by the block's budget
+        tag, payload = self._recv(self.started_at + self.cfg["import_timeout_s"], MAX_TEXT)
+        if tag != b"G":
+            # Before G only predict_child.py's own code has run (the seccomp filter goes in before the
+            # submission is imported), so this is the grader's failure, never the agent's.
+            self.guard_failed = True
+            self._kill()
+            self._give_up("network guard could not be installed (%s)" %
+                          (payload.decode(errors="replace")[:200] if payload else tag))
+            return False
+        deadline = min(self.started_at + self.cfg["import_timeout_s"], self.budget_end)
+        tag, payload = self._recv(deadline, MAX_TEXT)
+        if tag == b"R":
+            return True
+        self._kill()
+        if tag == b"I":
+            why = "import failed: " + payload.decode(errors="replace")[:200]
+        elif tag == "timeout":
+            why = "import did not finish in %ds" % self.cfg["import_timeout_s"] \
+                if time.monotonic() < self.budget_end else \
+                "timeout: the block's time budget (%ds) was spent" % self.budget
+        else:
+            why = "import failed: solver process ended before importing (%s)" % tag
+        self._give_up(why)
+        return False
+
+    def _frames(self):
+        """Hand out frames until one ends the process (a timeout or a death) or none is left."""
+        while self.remaining:
+            name = self.remaining.pop(0)
+            message = frame_message(self.sealed, name, self.privileged_run)
+            t0 = time.monotonic()
+            if t0 >= self.budget_end:
+                self.remaining.insert(0, name)
+                self._give_up("timeout: the block's time budget (%ds) was spent" % self.budget)
+                break
+            deadline = min(t0 + self.frame_limit, self.budget_end)
+            tag, payload = ("eof", None) if not self._send(message, deadline) else \
+                self._recv(deadline, MAX_RESULT)
+            if tag == "eof" and time.monotonic() >= deadline:
+                tag = "timeout"
+            self.elapsed[name] = round(time.monotonic() - t0, 2)
+            if tag == b"A":
+                with open(os.path.join(RESULTS, name + ".npy"), "wb") as handle:
+                    handle.write(payload)
+                self.status[name] = "returned"
+                continue
+            if tag == b"E":
+                self.status[name] = "no array: " + payload.decode(errors="replace")[:200]
+                continue
+            if tag == "timeout":
+                self.status[name] = "timeout: no array within %ds (process killed)" % self.frame_limit
+            elif tag == "eof":
+                try:
+                    code = self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    code = "unknown: it closed the channel"
+                self.status[name] = "solver process died (exit %s)" % code
+            else:
+                self.status[name] = "protocol violation (%s); process killed" % (tag,)
+            self._kill()
+            return
+        self._kill()
+
+    def run(self):
+        self.budget_end = time.monotonic() + self.budget
+        try:
+            while self.remaining:
+                if not self._import():
+                    break
+                self._frames()
+        except Exception as exc:                           # a grader bug: fail the verify, never score it
+            self.error = "%s: %s" % (type(exc).__name__, exc)
+            self._give_up("grader error")
+        finally:
+            self._kill()
 
 
-def run_solvers(names, cfg, logs):
+def frame_order(names, cfg, privileged_run):
+    """The order the frames are handed out in. A submission gets them in one fixed shuffle that mixes the scenes
+    (grader_config frame_order_seed), so a block holds a couple of views of many scenes and every call stands on
+    its own frame, as at deployment. The privileged reference gets them in scene order, only so that it loads each
+    scene's meshes once per block; that changes its run time, not what it is scored on."""
+    if privileged_run:
+        return list(names)
+    order = list(names)
+    random.Random(int(cfg["frame_order_seed"])).shuffle(order)
+    return order
+
+
+def run_solvers(names, cfg, logs, sealed, uid, privileged_run):
     n = int(cfg["solver_processes"])
-    per = -(-len(names) // n)             # contiguous blocks: a solver that caches per scene reloads it rarely
-    slots = [Slot(i, names[i * per:(i + 1) * per], cfg, logs) for i in range(n)]
-    for slot in slots:
-        if not slot.done:
-            slot.start()
-    status = {}
-    per_slot = -(-len(names) // n)
-    budget = per_slot * cfg["frame_timeout_s"] + 3 * cfg["import_timeout_s"] + 120
+    names = frame_order(names, cfg, privileged_run)
+    per = -(-len(names) // n)             # contiguous blocks of the handed-out order
+    slots = [Slot(i, names[i * per:(i + 1) * per], cfg, logs, sealed, uid, privileged_run) for i in range(n)]
     t0 = time.time()
-    while True:
-        now = time.time()
-        active = [s.poll(status, now) for s in slots]
-        if not any(active):
-            break
-        if now - t0 > budget:
-            for slot in slots:
-                slot.kill()
-                if not slot.done:
-                    slot._give_up(status, "prediction time budget (%ds) exhausted" % budget)
-            break
-        time.sleep(0.5)
-    return status, time.time() - t0, any(s.guard_failed for s in slots)
+    for slot in slots:
+        slot.start()
+    for slot in slots:
+        slot.join()
+    status, elapsed = {}, {}
+    for slot in slots:
+        status.update(slot.status)
+        elapsed.update(slot.elapsed)
+    errors = ["slot %d: %s" % (s.index, s.error) for s in slots if s.error]
+    require(not errors, "grader error while running the solver: " + "; ".join(errors))
+    restarts = sum(max(0, s.attempt - 1) for s in slots)
+    return status, elapsed, restarts, time.time() - t0, any(s.guard_failed for s in slots)
 
 
 # --------------------------------------------------------------------------- main
@@ -362,20 +480,22 @@ def main():
     require(len(frames) == cfg["expected_frames"],
             "hidden manifest lists %d frames, expected %d" % (len(frames), cfg["expected_frames"]))
     make_workdir()
-    export_inputs(sealed, frames, account.pw_uid, account.pw_gid, with_ground_truth=privileged(cfg))
+    privileged_run = privileged(cfg)
+    export_child(sealed, frames, with_ground_truth=privileged_run)
     logs = os.path.join(stage_dir(), "logs")
     os.makedirs(logs, exist_ok=True)
 
     names = ["%04d_%04d" % f for f in frames]
-    status, predict_wall, guard_failed = run_solvers(names, cfg, logs)
+    status, elapsed, restarts, predict_wall, guard_failed = run_solvers(
+        names, cfg, logs, sealed, account.pw_uid, privileged_run)
     stop_account(account.pw_uid)
     require(not guard_failed, "the network guard could not be installed; see %s" % logs)
-    log("prediction finished in %.0fs" % predict_wall)
+    log("prediction finished in %.0fs (%d restarts)" % (predict_wall, restarts))
 
     out_json = os.path.join(stage_dir(), "scores.json")
     t0 = time.time()
     rc = subprocess.call([GRASP_PY, "-I", os.path.join(stage_dir(), "score_frames.py"),
-                          sealed, PRED, out_json, str(cfg["score_workers"])],
+                          sealed, RESULTS, out_json, str(cfg["score_workers"])],
                          cwd=stage_dir())
     require(rc == 0, "score_frames.py exited %d" % rc)
     scores = json.load(open(out_json))
@@ -384,10 +504,16 @@ def main():
 
     rows = scores["per_frame"]
     for row in rows:
+        row["seconds"] = elapsed.get(row["frame"])
+        if status.get(row["frame"]) != "returned":
+            # only arrays received in time are in RESULTS; anything else scores 0 whatever it is
+            require(row["ap"] == 0.0 and row["status"] != "ok",
+                    "frame %s has no accepted array but was scored" % row["frame"])
         if row["status"] != "ok" or status.get(row["frame"]) != "returned":
             row["detail"] = status.get(row["frame"], "not run")
     ok = sum(1 for r in rows if r["status"] == "ok")
-    timeouts = sum(1 for r in rows if "timeout" in str(r.get("detail", "")))
+    timeouts = sum(1 for r in rows if str(status.get(r["frame"], "")).startswith("timeout"))
+    times = [t for t in elapsed.values() if t is not None]
     print(json.dumps({"mean_ap": scores["mean_ap"], "frames": len(rows), "frames_valid": ok,
                       "per_frame": rows}), flush=True)
     log("mean AP %.3f over %d frames (%d with a valid array, %d timeouts); starting detector %.3f"
@@ -399,7 +525,9 @@ def main():
         gain, anchor, cap=cap, higher_is_better=True, metric_name="ap_gain",
         full_at=meta.get("full_at", 1.0),
         extra={"mean_ap": scores["mean_ap"], "frames": len(rows), "frames_valid": ok,
-               "frames_timeout": timeouts, "predict_wall_s": round(predict_wall, 1),
+               "frames_timeout": timeouts, "solver_restarts": restarts,
+               "frame_s_max": round(max(times), 1) if times else 0.0,
+               "predict_wall_s": round(predict_wall, 1),
                "score_wall_s": round(score_wall, 1)}))
 
 

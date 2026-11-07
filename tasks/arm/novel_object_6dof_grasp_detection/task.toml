@@ -20,10 +20,12 @@ memory_mb = 65536
 timeout_sec = 14400
 network_mode = "no-network"
 
-# Verify: fetch and unpack the hidden frames (about 2 GB), at most 448 frames x 60 s over 8 solver
-# processes (56 min worst case), then scoring (about 15 min).
+# Verify: fetch and unpack the hidden frames (about 1.5 GB), then 8 solver processes on blocks of 56
+# frames, each within its block budget (grader_config.json): a submission's at most 56 x 10 s + 4 x 120 s
+# (17 min), the privileged reference's at most 56 x 300 s + 4 x 120 s (4.8 h; it needs about 1.5 h);
+# then scoring (about 15 min). The deadline covers the reference's budget.
 [verifier]
-timeout_sec = 7200
+timeout_sec = 21600
 environment_mode = "separate"
 
 [verifier.environment]

@@ -2,9 +2,16 @@
 
 Candidates come from grasplib and are ranked by a gradient-boosted scorer (the non-privileged reference). When the
 grader hands over the frame's ground truth (object poses and meshes, only for a submission that carries the oracle
-token, see tests/), the best candidates are labelled with graspnetAPI's own collision and force-closure test and
-re-ranked by the true label. Without ground truth it returns the scorer's ranking."""
-import os, sys, time, pickle
+token, see tests/), the reference runs graspnetAPI's own tests on them, exactly as eval_grasp does: every one of the
+TOP best-ranked candidates is checked for collision with the scene and the table and for enough object points between
+the fingers; per object, the candidates that pass are thinned with the evaluator's own NMS (0.03 m, 30 degrees) and up
+to PER_OBJ of them, best-ranked first, get the force-closure test at the six friction coefficients. The output is
+sorted by that true label. Without ground truth it returns the scorer's ranking.
+
+The amount of work per frame is fixed (N_SEEDS, TOP, PER_OBJ), never set by a clock, so the reference's score does not
+depend on the machine it runs on; the grader gives the privileged run its own per-call limit
+(grader_config.json oracle_frame_timeout_s) that this work stays well inside."""
+import os, sys, pickle
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -13,10 +20,10 @@ import grasplib  # noqa: E402
 
 _MODEL = pickle.load(open(os.path.join(HERE, "scorer.pkl"), "rb"))
 MAX_OUT = 2000
-GEN_BUDGET = 20.0
-N_LABEL = 500
-LABEL_DEADLINE = 36.0        # seconds into the call by which labelling must be done
-SEC_PER_LABEL = 0.03         # measured: about 0.028 s per candidate on one core
+N_SEEDS = 800                # surface seeds for grasplib
+TOP = 8000                   # best-ranked candidates checked for collision and emptiness
+PER_OBJ = 40                 # force-closure tests per object
+CHUNK = 500
 FRIC = np.array([0.2, 0.4, 0.6, 0.8, 1.0, 1.2])
 _SCENE = {}
 
@@ -53,7 +60,9 @@ def _scene(root, sid, view):
     return _SCENE["val"]
 
 
-def _true_labels(G, root, sid, view):
+def _labels(G, s, root, sid, view):
+    """True label per row of G (0 where untested or failing), and which rows were force-closure tested."""
+    from graspnetAPI import GraspGroup
     from graspnetAPI.utils.eval_utils import (transform_points, compute_closest_points, collision_detection,
                                               get_grasp_score)
     ge, fc_list, fcq, table, dexmodels, sampled = _scene(root, sid, view)
@@ -61,44 +70,53 @@ def _true_labels(G, root, sid, view):
     table_trans = transform_points(table, np.linalg.inv(np.matmul(align_mat, camera_pose)))
     mtl = [transform_points(m, pose_list[i]) for i, m in enumerate(sampled)]
     seg = np.concatenate([np.full(len(m), i) for i, m in enumerate(mtl)])
+    scene = np.concatenate(mtl + [table_trans])
     owner = seg[compute_closest_points(G[:, 13:16], np.concatenate(mtl))]
-    order = [np.nonzero(owner == i)[0] for i in range(len(mtl))]
-    coll, _, dexg = collision_detection([G[o] for o in order], mtl, dexmodels, pose_list,
-                                        np.concatenate(mtl + [table_trans]), outlier=0.05, return_dexgrasps=True)
-    y = np.zeros(len(G))
-    for i, o in enumerate(order):
-        for j, gi in enumerate(o):
-            if coll[i][j] or dexg[i][j] is None:
-                continue
-            s = get_grasp_score(dexg[i][j], dexmodels[i], fc_list, fcq)
-            if s > 0:
-                y[gi] = float(np.mean(s <= FRIC))
-    return y
+    y = np.zeros(len(G)); tested = np.zeros(len(G), bool)
+    for i in range(len(mtl)):
+        idx = np.nonzero(owner == i)[0]
+        if not len(idx):
+            continue
+        idx = idx[np.argsort(-s[idx])]
+        free, dexg = [], {}
+        for c0 in range(0, len(idx), CHUNK):
+            part = idx[c0:c0 + CHUNK]
+            lists = [np.zeros((0, 17))] * len(mtl); lists[i] = G[part]
+            coll, _, dg = collision_detection(lists, mtl, dexmodels, pose_list, scene, outlier=0.05,
+                                              return_dexgrasps=True)
+            for j, gi in enumerate(part):
+                if not coll[i][j] and dg[i][j] is not None:
+                    free.append(gi); dexg[gi] = dg[i][j]
+        if not free:
+            continue
+        free = np.array(free)
+        A = G[free].copy(); A[:, 0] = s[free]; A[:, 16] = np.arange(len(free))
+        kept = GraspGroup(A).nms(0.03, 30.0 / 180 * np.pi).grasp_group_array
+        order = free[kept[np.argsort(-kept[:, 0]), 16].astype(int)][:PER_OBJ]
+        for gi in order:
+            q = get_grasp_score(dexg[gi], dexmodels[i], fc_list, fcq)
+            tested[gi] = True
+            if q > 0:
+                y[gi] = float(np.mean(q <= FRIC))
+    return y, tested
 
 
 def predict(rgb, depth, intrinsics, depth_scale):
-    t0 = time.time()
     try:
         root, frame = os.environ.get("ORACLE_GT_ROOT"), os.environ.get("ORACLE_FRAME")
-        sid = view = None
-        if root and frame:
-            sid, view = (int(v) for v in frame.split("_"))
-            _scene(root, sid, view)                       # the slow part; cached for the next frame of the scene
-        loaded = time.time() - t0
-        n_seeds = 400 if loaded < 15 else 150             # a frame that had to load its scene gets a lighter pass
-        gen_budget = max(5.0, min(GEN_BUDGET, 34.0 - loaded))
-        cand, _ = grasplib.generate(depth, intrinsics, depth_scale, n_seeds=n_seeds, deadline=t0 + gen_budget)
+        cand, _ = grasplib.generate(depth, intrinsics, depth_scale, n_seeds=N_SEEDS)
         if cand is None:
             return _fallback(depth, intrinsics, depth_scale)
-        X = cand["feat"]
-        s = np.nan_to_num(_MODEL.predict(X), nan=-1.0)
-        n_label = int(min(N_LABEL, (LABEL_DEADLINE - (time.time() - t0)) / SEC_PER_LABEL)) if root and frame else 0
-        if n_label >= 100:
-            top = np.argsort(-s)[:n_label]
+        s = np.nan_to_num(_MODEL.predict(cand["feat"]), nan=-1.0)
+        if root and frame:
+            sid, view = (int(v) for v in frame.split("_"))
+            top = np.argsort(-s)[:TOP]
             G = grasplib.to_rows(cand, s, top)
-            y = _true_labels(G, root, sid, view)
-            G[:, 0] = y + 1e-3 * (s[top] - s[top].min()) / (np.ptp(s[top]) + 1e-9)
-            rows = G[np.argsort(-G[:, 0])]
+            st = s[top]
+            y, tested = _labels(G, st, root, sid, view)
+            tie = 1e-3 * (st - st.min()) / (np.ptp(st) + 1e-9)
+            G[:, 0] = np.where(tested, y, -1.0) + tie
+            rows = G[np.argsort(-G[:, 0])][:MAX_OUT]
         else:
             idx = np.argsort(-s)[:MAX_OUT]
             rows = grasplib.to_rows(cand, s, idx)
@@ -109,4 +127,6 @@ def predict(rgb, depth, intrinsics, depth_scale):
         rows = rows[ok]
         return rows if len(rows) else _fallback(depth, intrinsics, depth_scale)
     except Exception:
+        import traceback
+        traceback.print_exc()
         return _fallback(depth, intrinsics, depth_scale)

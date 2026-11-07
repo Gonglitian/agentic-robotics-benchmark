@@ -43,20 +43,19 @@ RUN uv venv /opt/venv --python 3.12 \
     && chmod -R a+rX /opt/venv /opt/grasp \
     && { [ ! -d /opt/uv-python ] || chmod -R a+rX /opt/uv-python; }
 
-# Agent-visible data, derived from GraspNet-1Billion (Fang et al., CVPR 2020,
-# https://graspnet.net) and redistributed under its own non-commercial licence
-# (CC BY-NC-SA 4.0; see NOTICE inside the archive): 20 development scenes and 12 practice
-# scenes at 8 viewpoints each, meshes with signed-distance fields for the practice objects,
-# and grasp annotations for ten development objects. Pinned to a dataset revision and checked
-# by hash. None of the 26 objects in the hidden frames appears in it.
-ARG DATA_BASE=https://huggingface.co/datasets/Litian2002/graspnet1b-rsi-exam/resolve/0fb5e27036c85a43c7494b4f1752b90ad03a61f2
-RUN mkdir -p /data/graspnet \
- && curl -fsSL --retry 10 --retry-delay 5 --retry-all-errors -C - "$DATA_BASE/agent_bundle.tar.gz" -o /tmp/agent_bundle.tar.gz \
- && echo "5343d6c7f693c7f08440862bc7a692242042911a94acb27f865831aab4d6aaed  /tmp/agent_bundle.tar.gz" | sha256sum -c - \
- && tar -xzf /tmp/agent_bundle.tar.gz -C /data/graspnet --strip-components=1 \
- && rm /tmp/agent_bundle.tar.gz \
- && curl -fsSL --retry 10 "$DATA_BASE/agent_manifest.json" -o /data/graspnet/manifest.json \
- && echo "76885bc7c08b948d753cb2d8c759258ea46c707d1cd4fc00a3250e3e0a605d9c  /data/graspnet/manifest.json" | sha256sum -c - \
+# ---- task assets: fetched at the dataset commit pinned in assets.sha256, checked file by file (docs/task-assets.md):
+# graspnet/, the agent-visible data, derived from GraspNet-1Billion (Fang et al., CVPR 2020, https://graspnet.net)
+# and redistributed under its own non-commercial licence (CC BY-NC-SA 4.0; see NOTICE): 20 development scenes and 12
+# practice scenes at 8 viewpoints each, meshes with signed-distance fields for the practice objects, and grasp
+# annotations for ten development objects, as one archive and its manifest. The archive is unpacked into the
+# root-owned /data/graspnet and is not staged into the agent home; the list holds nothing else, so the fetched
+# folder is removed. None of the 26 objects in the hidden frames appears in it.
+COPY fetch_assets.py assets.sha256 /opt/task-assets/
+RUN python3 /opt/task-assets/fetch_assets.py /opt/task-assets/assets.sha256 /opt/task-assets/payload \
+ && mkdir -p /data/graspnet \
+ && tar -xzf /opt/task-assets/payload/graspnet/agent_bundle.tar.gz -C /data/graspnet --strip-components=1 \
+ && cp /opt/task-assets/payload/graspnet/agent_manifest.json /data/graspnet/manifest.json \
+ && rm -rf /opt/task-assets/payload \
  && chown -R root:root /data/graspnet && chmod -R a+rX,go-w /data/graspnet
 
 # Cut the bundle down to the annotated objects: no meshes and no practice-scene poses, so the
@@ -76,6 +75,3 @@ ENV GRASPNET_DATA=/data/graspnet
 RUN python3 -c "import sys, numpy; assert sys.version_info >= (3, 12); print('[image] python3', sys.version.split()[0], 'numpy', numpy.__version__)" \
     && runuser -u user -- python3 -c "import numpy; print('[image] agent-UID /opt/venv OK')" \
     && runuser -u user -- /opt/grasp/bin/python -c "import numpy, sklearn, open3d, cv2, torch, graspnetAPI; from graspnetAPI.utils.eval_utils import eval_grasp; assert numpy.__version__ == '1.23.5'; print('[image] agent-UID /opt/grasp OK')"
-
-# evaluation copy only (docs/contributing-a-task.md section 7): keep long-thinking model streams alive
-ENV BUN_CONFIG_HTTP_IDLE_TIMEOUT=1800 CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000

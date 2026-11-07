@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run the submitted detector over a list of hidden frames, as the agent's account, offline.
+"""Run the submitted detector on hidden frames handed over one at a time, as the agent's account, offline.
 
 verify.py copies this file to a root-owned directory and starts it with
-`runuser -u <agent> -- /opt/grasp/bin/python -I predict_child.py ...`, so the agent can neither
+`runuser -u <agent> -- /opt/grasp/bin/python -I predict_child.py <tag>`, so the agent can neither
 edit it nor plant code that runs before it (-I: no user site-packages, no PYTHON* variables,
 no script directory on sys.path).
 
@@ -11,18 +11,22 @@ AF_INET/AF_INET6 sockets and io_uring. The filter is inherited by every thread a
 process and cannot be removed, so the detector is graded offline even though the engine
 opens egress for the verify stage (the hidden frames' labels are public on the internet).
 
-Protocol, all through files in OUT (owned by the agent's account, read by root afterwards):
-  _guard_ok_<tag>       the seccomp filter is in place (written before the submission runs)
-  _ready_<tag>          the submission imported
-  _import_error_<tag>   it did not (first 2000 characters of the error)
-  <frame>.started       predict() is being called for this frame
-  <frame>.npy           the returned array (float64), written only on success
-  <frame>.err           why the frame produced no array
+Protocol: messages over the process's stdin (from the grader) and stdout (to the grader), each a
+1-byte tag, a 4-byte big-endian length and the payload. Before the submission is imported, fd 0
+and fd 1 are moved out of the way (stdin becomes /dev/null, stdout the log), so nothing the
+submission prints reaches the grader.
+  child -> grader   G  the seccomp filter is in place      X  it could not be installed (text)
+                    R  the submission imported              I  it did not (text, first 2000 characters)
+                    A  the returned array (.npy bytes)      E  no array for this frame (text)
+  grader -> child   F  one frame: a JSON header line {"name", "sizes"}, then rgb.png, depth.png
+                       and camK.npy; "name" is empty except for the privileged reference
+The grader sends the next frame only after it has the answer to the current one, times every
+call on its own clock and kills the process when a call runs over; nothing here keeps time.
+The process ends when the grader closes its stdin.
 """
 import ctypes
 import os
 import platform
-import signal
 import struct
 import sys
 import time
@@ -85,70 +89,98 @@ def block_network():
         raise RuntimeError("network guard is not effective for family %d" % family)
 
 
-class FrameTimeout(Exception):
-    pass
+MAX_ARRAY_ROWS = 5000
 
 
-def _alarm(signum, frame):
-    raise FrameTimeout()
+def send(out, tag, payload=b""):
+    out.write(tag + struct.pack(">I", len(payload)) + payload)
+    out.flush()
 
 
-def _write(path, text):
-    with open(path, "w") as handle:
-        handle.write(text)
+def read_exact(inp, n):
+    chunks, left = [], n
+    while left:
+        chunk = inp.read(left)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        left -= len(chunk)
+    return b"".join(chunks)
+
+
+def recv(inp):
+    head = read_exact(inp, 5)
+    if head is None:
+        return None, None
+    payload = read_exact(inp, struct.unpack(">I", head[1:])[0])
+    return (head[:1], payload) if payload is not None else (None, None)
+
+
+def decode_frame(payload):
+    import io
+    import json
+    import numpy as np
+    from PIL import Image
+    line, _, blob = payload.partition(b"\n")
+    header = json.loads(line.decode())
+    parts, at = [], 0
+    for size in header["sizes"]:
+        parts.append(blob[at:at + size])
+        at += size
+    rgb = np.array(Image.open(io.BytesIO(parts[0])))
+    depth = np.array(Image.open(io.BytesIO(parts[1])))
+    K = np.load(io.BytesIO(parts[2]), allow_pickle=False)
+    return header.get("name", ""), rgb, depth, K
 
 
 def main():
-    frames_dir, out_dir, listing, tag, frame_timeout = sys.argv[1:6]
-    frame_timeout = int(frame_timeout)
+    tag = sys.argv[1]
+    # The protocol channel: private duplicates of fd 0 and fd 1 (not inherited by subprocesses).
+    inp = os.fdopen(os.dup(0), "rb", buffering=0)
+    out = os.fdopen(os.dup(1), "wb")
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+    os.dup2(2, 1)                                        # the submission's prints go to the log
     try:
         block_network()
     except Exception as exc:
-        print("[child] network guard failed: %s" % exc, file=sys.stderr, flush=True)
+        print("[child %s] network guard failed: %s" % (tag, exc), file=sys.stderr, flush=True)
+        send(out, b"X", str(exc)[:300].encode(errors="replace"))
         return 3
-    _write(os.path.join(out_dir, "_guard_ok_" + tag), "")
+    send(out, b"G")
 
+    import io
     import numpy as np
-    from PIL import Image
 
     sys.path.insert(0, SUBMISSION)
     try:
         import solver                                    # the submitted code
         predict = solver.predict
     except BaseException as exc:                         # noqa: BLE001 — any failure is the agent's
-        _write(os.path.join(out_dir, "_import_error_" + tag),
-               ("%s: %s" % (type(exc).__name__, exc))[:2000])
+        send(out, b"I", ("%s: %s" % (type(exc).__name__, exc))[:2000].encode(errors="replace"))
         return 4
-    _write(os.path.join(out_dir, "_ready_" + tag), "")
+    send(out, b"R")
 
-    with open(listing) as handle:
-        names = [line.strip() for line in handle if line.strip()]
-    signal.signal(signal.SIGALRM, _alarm)
-    for name in names:
-        d = os.path.join(frames_dir, name)
-        rgb = np.array(Image.open(os.path.join(d, "rgb.png")))
-        depth = np.array(Image.open(os.path.join(d, "depth.png")))
-        K = np.load(os.path.join(d, "camK.npy"))
-        os.environ["ORACLE_FRAME"] = name                # only read by the reference detector, which alone gets ground truth
-        _write(os.path.join(out_dir, name + ".started"), "")
+    while True:
+        kind, payload = recv(inp)
+        if kind != b"F":
+            return 0
+        name, rgb, depth, K = decode_frame(payload)
+        if name:
+            os.environ["ORACLE_FRAME"] = name            # sent only to the privileged reference
         t0 = time.time()
-        signal.alarm(frame_timeout)
         try:
             grasps = np.asarray(predict(rgb, depth, K, 1000.0), dtype=np.float64)
-            signal.alarm(0)
-            tmp = os.path.join(out_dir, name + ".tmp.npy")
-            np.save(tmp, grasps)
-            os.replace(tmp, os.path.join(out_dir, name + ".npy"))
-        except FrameTimeout:
-            _write(os.path.join(out_dir, name + ".err"), "timeout after %ds" % frame_timeout)
+            if grasps.ndim != 2 or grasps.shape[1:] != (17,) or len(grasps) > MAX_ARRAY_ROWS:
+                raise ValueError("returned shape %s" % (grasps.shape,))
+            buf = io.BytesIO()
+            np.save(buf, grasps, allow_pickle=False)
+            reply = (b"A", buf.getvalue())
         except BaseException as exc:                     # noqa: BLE001 — one bad frame, not the rest
-            signal.alarm(0)
-            _write(os.path.join(out_dir, name + ".err"),
-                   ("%s: %s" % (type(exc).__name__, exc))[:300])
-        finally:
-            signal.alarm(0)
-        print("[child] %s %.1fs" % (name, time.time() - t0), flush=True)
-    return 0
+            reply = (b"E", ("%s: %s" % (type(exc).__name__, exc))[:300].encode(errors="replace"))
+        print("[child %s] %s %.1fs" % (tag, name or "frame", time.time() - t0), file=sys.stderr, flush=True)
+        send(out, *reply)
 
 
 if __name__ == "__main__":
