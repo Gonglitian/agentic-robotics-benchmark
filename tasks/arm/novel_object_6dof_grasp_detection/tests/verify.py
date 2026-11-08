@@ -4,7 +4,10 @@ Pattern: artifact_rollout. The agent leaves a Python module, /home/user/submissi
 whose predict(rgb, depth, intrinsics, depth_scale) returns grasps. This stage:
 
   1. scores an honest 0 when there is no solver.py (the untouched pass of `ale validate`);
-  2. stops every process the agent's account left running;
+  2. stops every process the agent's account left running. The image's supervisord respawns the desktop it runs
+     as that account as fast as it is killed, so one that outlives the kill is frozen and recorded (only one still
+     running once frozen voids the run), and every process of the account this stage did not start stays stopped
+     until the verdict is written;
   3. fetches the hidden frames (28 GraspNet-1Billion novel-object scenes x 16 views, meshes and
      poses for their 26 objects; pinned and hash-checked) into this root-only stage folder;
   4. runs the detector in 8 processes as the agent's account, offline (seccomp, see
@@ -86,30 +89,125 @@ def _live_uid_pids(uid):
     return pids
 
 
+def _proc_state(pid):
+    """The /proc state letter of `pid` ("X" once it is gone)."""
+    try:
+        with open("/proc/%d/status" % pid) as handle:
+            for line in handle:
+                if line.startswith("State:"):
+                    return line.split()[1]
+    except (OSError, IndexError):
+        pass
+    return "X"
+
+
+def _describe(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            return "%d %s" % (pid, handle.read().replace(b"\0", b" ")[:120].decode(errors="replace"))
+    except OSError:
+        return "%d (gone)" % pid
+
+
+def _freeze(uid, bound_s=3.0):
+    """SIGSTOP every live process of `uid` until a pass finds none still running (a respawn that appears meanwhile is
+    stopped by the next pass) or `bound_s` elapsed. Returns (stopped, running): the PIDs seen stopped and those still
+    running at the end (empty: every one is stopped)."""
+    deadline = time.time() + float(bound_s)
+    stopped = set()
+    while True:
+        for pid in _live_uid_pids(uid):
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:
+                pass
+        time.sleep(0.05)
+        running = []
+        for pid in _live_uid_pids(uid):
+            if _proc_state(pid) in ("T", "t"):
+                stopped.add(pid)
+            else:
+                running.append(pid)
+        if not running or time.time() > deadline:
+            return sorted(stopped), running
+
+
 def stop_account(uid):
-    """SIGKILL every live process of `uid`, repeating until none is left (they may fork)."""
+    """SIGKILL every live process of `uid`, repeating until none is left (they may fork). Returns the PIDs that
+    outlived the kill and were frozen instead.
+
+    The image's supervisord (PID 1) runs the desktop as the agent's account and respawns it as fast as it is killed,
+    so in this separate verifier, where nothing of the agent's ever ran, a process that outlives the 20 passes is the
+    image's own. It is frozen (a stopped process cannot exit, so it is not respawned) and recorded; only one still
+    running once frozen voids the run."""
     for _ in range(20):
         pids = _live_uid_pids(uid)
         if not pids:
-            return
+            return []
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
         time.sleep(0.2)
-    left = []
-    for entry in os.listdir("/proc"):
-        if entry.isdigit():
-            try:
-                with open("/proc/%s/status" % entry) as handle:
-                    if any(l.startswith("Uid:") and int(l.split()[1]) == uid for l in handle):
-                        with open("/proc/%s/cmdline" % entry, "rb") as c:
-                            left.append("%s %s" % (entry, c.read().replace(b"\0", b" ")[:120].decode(errors="replace")))
-            except (OSError, ValueError):
+    stopped, running = _freeze(uid)
+    log("%d process(es) of uid %d outlived the kill, frozen: %s" % (len(stopped), uid,
+                                                                     "; ".join(map(_describe, stopped)) or "none"))
+    if running:
+        log("still running as uid %d after the freeze: %s" % (uid, "; ".join(map(_describe, running))))
+        fail("%d process(es) of uid %d outlived SIGKILL and could not be stopped" % (len(running), uid))
+    return stopped
+
+
+def _descends_from(pid, ancestor):
+    """True if `ancestor` is a (grand)parent of `pid` (by /proc PPid)."""
+    for _ in range(64):
+        try:
+            with open("/proc/%d/status" % pid) as handle:
+                ppid = next(int(l.split()[1]) for l in handle if l.startswith("PPid:"))
+        except (OSError, ValueError, StopIteration):
+            return False
+        if ppid == ancestor:
+            return True
+        if ppid <= 1:
+            return False
+        pid = ppid
+    return False
+
+
+class AccountFreezer(threading.Thread):
+    """Keeps every process of the agent's account that this grader did not start stopped, polling /proc every
+    `period_s`, until the verdict is written. The solver processes run as that account too and could SIGCONT a frozen
+    process, or kill the desktop so that supervisord starts it again (running the account's autostart entries outside
+    the network guard); either is stopped again within one period. Processes descended from this grader (the
+    solvers, under runuser) are left alone."""
+
+    def __init__(self, uid, period_s=0.1):
+        threading.Thread.__init__(self, name="freezer", daemon=True)
+        self.uid, self.period_s, self.frozen = uid, float(period_s), set()
+        self.halt = threading.Event()
+        self.me = os.getpid()
+
+    def _exempt(self, pid):
+        return _descends_from(pid, self.me)
+
+    def freeze_now(self):
+        for pid in _live_uid_pids(self.uid):
+            if pid == self.me or self._exempt(pid):
                 continue
-    log("still running as uid %d: %s" % (uid, "; ".join(left) or "none visible"))
-    fail("processes of uid %d keep reappearing after SIGKILL" % uid)
+            try:
+                os.kill(pid, signal.SIGSTOP)
+                self.frozen.add(pid)
+            except OSError:
+                pass
+
+    def run(self):
+        while not self.halt.is_set():
+            try:
+                self.freeze_now()
+            except Exception:                              # the freezer must never take the grader down
+                pass
+            self.halt.wait(self.period_s)
 
 
 # --------------------------------------------------------------------------- hidden frames
@@ -474,7 +572,9 @@ def main():
         return
 
     account = pwd.getpwnam(agent_user())
-    stop_account(account.pw_uid)
+    outlived = len(stop_account(account.pw_uid))
+    freezer = AccountFreezer(account.pw_uid)
+    freezer.start()
     sealed = fetch_hidden(cfg)
     frames = hidden_frames(sealed)
     require(len(frames) == cfg["expected_frames"],
@@ -488,7 +588,7 @@ def main():
     names = ["%04d_%04d" % f for f in frames]
     status, elapsed, restarts, predict_wall, guard_failed = run_solvers(
         names, cfg, logs, sealed, account.pw_uid, privileged_run)
-    stop_account(account.pw_uid)
+    outlived += len(stop_account(account.pw_uid))
     require(not guard_failed, "the network guard could not be installed; see %s" % logs)
     log("prediction finished in %.0fs (%d restarts)" % (predict_wall, restarts))
 
@@ -528,7 +628,10 @@ def main():
                "frames_timeout": timeouts, "solver_restarts": restarts,
                "frame_s_max": round(max(times), 1) if times else 0.0,
                "predict_wall_s": round(predict_wall, 1),
-               "score_wall_s": round(score_wall, 1)}))
+               "score_wall_s": round(score_wall, 1),
+               "agent_processes_outlived_kill": outlived,
+               "agent_processes_frozen": len(freezer.frozen)}))
+    freezer.halt.set()
 
 
 if __name__ == "__main__":
