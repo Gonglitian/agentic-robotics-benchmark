@@ -1,7 +1,7 @@
 {
-  "hidden_bundle_url": "https://huggingface.co/datasets/grounded-intelligence-initiative/agentic-robotics-last-exam/resolve/7a40bd84521f7b167a180578f6a5927fc0955d80/tasks/arm/novel_object_6dof_grasp_detection/verifier/verifier_bundle.tar.gz",
+  "hidden_bundle_url": "https://huggingface.co/datasets/grounded-intelligence-initiative/ale-robotics-assets/resolve/7a40bd84521f7b167a180578f6a5927fc0955d80/tasks/arm/novel_object_6dof_grasp_detection/verifier/verifier_bundle.tar.gz",
   "hidden_bundle_sha256": "d4636e89acead01aad82017912891dea79c7c2dd88a751835307c595a4f9ce0e",
-  "hidden_manifest_url": "https://huggingface.co/datasets/grounded-intelligence-initiative/agentic-robotics-last-exam/resolve/7a40bd84521f7b167a180578f6a5927fc0955d80/tasks/arm/novel_object_6dof_grasp_detection/verifier/verifier_manifest.json",
+  "hidden_manifest_url": "https://huggingface.co/datasets/grounded-intelligence-initiative/ale-robotics-assets/resolve/7a40bd84521f7b167a180578f6a5927fc0955d80/tasks/arm/novel_object_6dof_grasp_detection/verifier/verifier_manifest.json",
   "hidden_manifest_sha256": "9ba5c4519ceefe32f22c14ff80c9cceae81f43010319898d55122e07a9c34994",
   "expected_frames": 448,
   "solver_processes": 8,

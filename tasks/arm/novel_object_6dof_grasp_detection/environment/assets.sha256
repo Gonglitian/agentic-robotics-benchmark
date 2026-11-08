@@ -1,5 +1,5 @@
 # endpoint: https://huggingface.co
-# repo: grounded-intelligence-initiative/agentic-robotics-last-exam
+# repo: grounded-intelligence-initiative/ale-robotics-assets
 # revision: 7a40bd84521f7b167a180578f6a5927fc0955d80
 # prefix: tasks/arm/novel_object_6dof_grasp_detection/payload
 4f35351b87d6eb8d9ddeee5e39bd9fbb4296f9de87e773ee9c6a930dda1b6196  graspnet/NOTICE
